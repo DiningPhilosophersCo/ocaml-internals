@@ -1,5 +1,5 @@
 ---
-title: Implementation
+title: Stack switching in OCaml 5
 sidebar_position: 1
 ---
 
@@ -425,11 +425,251 @@ execution can switch as necessary.
     What happens when raise exception doesn't match with any handler? Re-raise!
 
 
-## TODO insert code snippet
+## Effects
 
+Effects, as we saw earlier, setup new stacks on the heap and switch to
+it. You can see this your self in `stdlib/effect.ml`
 
-# TODO How are effects handled? Records on stack
+    let match_with comp arg handler =
+      let effc eff k last_fiber =
+        match handler.effc eff with
+        | Some f ->
+            cont_set_last_fiber k last_fiber;
+            f k
+        | None -> reperform eff k last_fiber
+      in
+      let s = alloc_stack handler.retc handler.exnc effc in
+      runstack s comp arg
 
-# TODO What does an OCaml frame look like?
+The user provided `effc` is augmented with a continuation, `k`, and
+, `last_fiber`, both of which are provided by the runtime function,
+`alloc_stack`.
 
+Once a stack is allocated, it is used to run the computation, `comp`
+with it's arguments, on the new stack with `runstack`
 
+To understand the runtime functions, `alloc_stack` and `runstack`,
+let's compile a simple program and examine it's assembly.
+
+Here's a program whose assembly output we'll examine
+
+```ocaml
+    type _ Effect.t += Hello : unit Effect.t
+    
+    let main () =
+      Effect.perform Hello
+    
+    let () =
+      let retc = Fun.id in
+      let exnc = raise in
+      let effc : type c. c Effect.t -> ((c, 'a) Effect.Deep.continuation -> 'a) option = function
+        | Hello -> Some (fun k -> print_endline "Hello"; Effect.Deep.continue k ())
+        | _ -> None
+      in
+      Effect.Deep.match_with main () { retc; exnc; effc }
+```
+
+Starting with `main`, which only performs an effect,
+
+```asm
+    _camlMain.main_277:
+            .cfi_startproc
+            sub	sp, sp, #16
+            .cfi_adjust_cfa_offset	16
+            .cfi_offset 30, -8
+            str	x30, [sp, #8]
+    L100:
+            ldr	x16, [x28, #0]
+            sub	x27, x27, #24
+            cmp	x27, x16
+            b.lo	L103
+    L102:	add	x1, x27, #8
+            movz	x2, #2293, lsl #0
+            str	x2, [x1, #-8]
+            orr	x3, xzr, #1
+            str	x3, [x1, #0]
+            orr	x4, xzr, #1
+            str	x4, [x1, #8]
+            adrp	x5, _camlMain@GOTPAGE
+            ldr	x5, [x5, _camlMain@GOTPAGEOFF]
+            ldr	x0, [x5, #0]
+            ldr	x30, [sp, #8]
+            add	sp, sp, #16
+            .cfi_adjust_cfa_offset	-16
+            b	_caml_perform
+            .cfi_adjust_cfa_offset	16
+    L103:	bl	_caml_call_gc
+    L101:	b	L102
+            .cfi_endproc
+```
+
+1.  Grow the stack to push a new pointer
+2.  Push `x30`, the program counter (see `asmcomp/arm64/proc.ml` for the
+    full reference)
+3.  Load the young gc limit found in domain state (stored in `x28`)
+    Since `young_limit` is the first field of the struct in
+    `runtime/caml/domain_state.tbl`, the offet is `#0`
+4.  Subtract alloc pointer (`x27`) by 3 bytes to accomodate the effect
+5.  Compare alloc pointer and young limit to check if garbage
+    collection is to be triggered.
+
+Performing an effect happens in the C realm, in `caml_perform`. So, the rest of the
+instructions are setting up the registers as per calling conventions.
+
+From the runtime source, `arm64.S`, we have the following comment.
+
+```asm
+    /*  x0: effect to perform
+        x1: continuation
+        x2: old_stack
+        x3: last_fiber */
+```
+
+So, `caml_perform` expects these registers. So, before FFI'ing into
+the C layer's `caml_perform`, the compiler must setup this register in
+`main`
+
+And it does so after pushing the return address to th stack.
+
+1.  Set the effect in `x0`
+    
+```asm
+        adrp	x5, _camlMain@GOTPAGE
+        ldr	x5, [x5, _camlMain@GOTPAGEOFF]
+        ldr	x0, [x5, #0]
+```
+
+2.  Set the continuation, parent stack and parent fiber in `x1`, `x2`
+    and `x3` respectively
+
+3.  Call `caml_perform`
+
+Performed effect is passed to the `effc` in a new stack and stack is switched
+
+```asm
+    str     xzr, Handler_parent(x9) /* Set parent of performer to NULL */
+    ldr     TMP, Handler_effect(x9)
+    mov     x2, x3                 /* x2 := last_fiber */
+    mov     x3, TMP                /* x3 := effect handler */
+    b       G(caml_apply3)
+```
+
+which basically calls the following in `stdlib/effect.ml`
+
+```ocaml
+    let effc eff k last_fiber =
+      match handler.effc eff with
+      | Some f ->
+          cont_set_last_fiber k last_fiber;
+          f k
+      | None -> reperform eff k last_fiber
+    in
+```
+
+If parent handler is null,
+
+```asm
+    ldr     9, Stack_handler(x2)  /* x9 := old stack -> handler */
+    ldr     x10, Handler_parent(x9) /* x10 := parent stack */
+    cbz     x10, 1f
+```
+
+Then,
+
+```
+            str     xzr, Handler_parent(x9) /* Set parent of performer to NULL */
+            ldr     TMP, Handler_effect(x9)
+            mov     x2, x3                 /* x2 := last_fiber */
+            mov     x3, TMP                /* x3 := effect handler */
+            b       G(caml_apply3)
+    1:
+        /*  switch back to original performer before raising Effect.Unhandled
+            (no-op unless this is a reperform) */
+            ldr     x10, [x1] /* load performer stack from continuation */
+            sub     x10, x10, 1 /* x10 := Ptr_val(x10) */
+            ldr     x9, Caml_state(current_stack)
+            SWITCH_OCAML_STACKS x9, x10
+```
+
+ie raise unhandled exception
+
+Now let's examine the runtime functions, `runstack` and `alloc_stack`.
+
+`runstack` runs our `main` function, so let's look at it first.
+
+From `arm64.S`,
+
+```asm
+    stp     x29, x30, [sp, -16]!
+```
+
+Pushes frame and link register to the stack.
+
+```asm
+    add     x29, sp, #0
+```
+
+Set the frame register to current stack pointer.
+
+Some self explanatory code,
+
+```asm
+    /*  save old stack pointer and exception handler */
+        ldr     x8, Caml_state(current_stack) /* x8 := old stack */
+        mov     TMP, sp
+        str     TMP, Stack_sp(x8)
+        str     TRAP_PTR, Stack_exception(x8)
+    /* Load new stack pointer and set parent */
+        ldr     TMP, Stack_handler(x0)
+        str     x8, Handler_parent(TMP)
+        str     x0, Caml_state(current_stack)
+        ldr     x9, Stack_sp(x0) /* x9 := sp of new stack */
+```
+
+Because, we'll be switch stacks shortly.
+
+```asm
+    /* Create an exception handler on the target stack
+       after 16byte DWARF & gc_regs block (which is unused here) */
+        sub     x9, x9, 32
+        adr     TMP, L(fiber_exn_handler)
+        str     TMP, [x9, 8]
+```
+
+Each new stack needs its own global exception handler
+
+Another documented assembly,
+
+```asm
+    /* Call the function on the new stack */
+        mov     x0, x2
+        blr     x3
+```
+
+How was this new stack created as we saw in `stdlib/effect.ml`?
+
+```c
+    let s = alloc_stack handler.retc handler.exnc effc in
+
+    CAMLprim value caml_alloc_stack(value hval, value hexn, value heff)
+    {
+      value* sp;
+      const int64_t id = atomic_fetch_add(&fiber_id, 1);
+      struct stack_info* stack =
+        alloc_size_class_stack_noexc(caml_fiber_wsz, 0 /* first bucket */,
+                                     hval, hexn, heff, id);
+    
+      if (!stack) caml_raise_out_of_memory();
+    
+      sp = Stack_high(stack);
+      sp -= 1;
+      sp[0] = Val_long(1);
+    
+      stack->sp = sp;
+    
+      return Val_ptr(stack);
+    }
+```
+
+which leads to `alloc_size_class_stack_noexc` - it allocates a new
+stack double the size quickly from a cache of stacks.
