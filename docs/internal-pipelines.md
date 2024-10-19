@@ -8,5 +8,5 @@ sidebar_position: 2
 
 ## History
 Re-drawn on Figma by us.
-Melange and JS IR edits by Antonion Monteiro: https://x.com/_anmonteiro/status/1648937092599390208
+Melange and JS IR edits by Antonio Monteiro: https://x.com/_anmonteiro/status/1648937092599390208
 Original by OCaml Pro.
